@@ -3867,6 +3867,7 @@ dependencies = [
  "cfg-if",
  "hvdef",
  "minimal_rt_build",
+ "tdcall",
  "zerocopy",
 ]
 
