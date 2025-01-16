@@ -843,7 +843,7 @@ impl<'a, T: From<&'a str> + Default, R> FieldDecode<'a, T, R> for StringField {
 /// [`Cow::Borrowed`] on read.
 pub struct BorrowedCowField;
 
-impl<'a> DescribeField<Cow<'a, str>> for BorrowedCowField {
+impl DescribeField<Cow<'_, str>> for BorrowedCowField {
     const FIELD_TYPE: FieldType<'static> = FieldType::builtin("string");
 }
 
@@ -1071,7 +1071,7 @@ impl<T, R, E: FieldEncode<T, R>> FieldEncode<Vec<T>, R> for VecField<E> {
         // Other packed sequences may still get a bytes value at runtime, but
         // they also support non-packed encodings and so must be wrapped when
         // they're nested in another sequence.
-        let bytes = E::packed().map_or(false, |p| p.must_pack());
+        let bytes = E::packed().is_some_and(|p| p.must_pack());
         !bytes
     }
 }
@@ -1116,7 +1116,7 @@ impl<'a, T, R, E: FieldDecode<'a, T, R>> FieldDecode<'a, Vec<T>, R> for VecField
         // Other packed sequences may still get a bytes value at runtime, but
         // they also support non-packed encodings and so must be wrapped when
         // they're nested in another sequence.
-        let bytes = E::packed::<Vec<T>>().map_or(false, |p| p.must_pack());
+        let bytes = E::packed::<Vec<T>>().is_some_and(|p| p.must_pack());
         !bytes
     }
 }
@@ -1649,15 +1649,15 @@ default_encodings! {
     Infallible: ImpossibleField,
 }
 
-impl<'a> DefaultEncoding for &'a str {
+impl DefaultEncoding for &str {
     type Encoding = StringField;
 }
 
-impl<'a> DefaultEncoding for &'a [u8] {
+impl DefaultEncoding for &[u8] {
     type Encoding = BytesField;
 }
 
-impl<'a> DefaultEncoding for Cow<'a, str> {
+impl DefaultEncoding for Cow<'_, str> {
     type Encoding = StringField;
 }
 

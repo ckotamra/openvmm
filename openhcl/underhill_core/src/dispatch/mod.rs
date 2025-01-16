@@ -33,7 +33,6 @@ use hyperv_ic_resources::shutdown::ShutdownType;
 use igvm_defs::MemoryMapEntryType;
 use inspect::Inspect;
 use mesh::error::RemoteError;
-use mesh::error::RemoteResult;
 use mesh::rpc::FailableRpc;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
@@ -179,10 +178,11 @@ pub(crate) struct LoadedVm {
 
     pub shared_vis_pool: Option<PagePool>,
     pub private_pool: Option<PagePool>,
+    pub nvme_keep_alive: bool,
 }
 
 pub struct LoadedVmState<T> {
-    pub restart_response: mesh::OneshotSender<RemoteResult<T>>,
+    pub restart_rpc: FailableRpc<(), T>,
     pub servicing_state: ServicingState,
     pub vm_rpc: mesh::Receiver<UhVmRpc>,
     pub control_send: mesh::Sender<ControlRequest>,
@@ -190,7 +190,7 @@ pub struct LoadedVmState<T> {
 
 impl LoadedVm {
     /// Start running the VM which will start running VTL0.
-    pub async fn run<T: MeshPayload>(
+    pub async fn run<T: 'static + MeshPayload + Send>(
         mut self,
         threadpool: &AffinitizedThreadpool,
         autostart_vps: bool,
@@ -261,16 +261,16 @@ impl LoadedVm {
                 Event::WorkerRpcGone => break None,
                 Event::WorkerRpc(message) => match message {
                     WorkerRpc::Stop => break None,
-                    WorkerRpc::Restart(response) => {
+                    WorkerRpc::Restart(rpc) => {
                         let state = async {
                             let running = self.stop().await;
                             match self.save(None, false).await {
-                                Ok(servicing_state) => Some((response, servicing_state)),
+                                Ok(servicing_state) => Some((rpc, servicing_state)),
                                 Err(err) => {
                                     if running {
                                         self.start(None).await;
                                     }
-                                    response.send(Err(RemoteError::new(err)));
+                                    rpc.complete(Err(RemoteError::new(err)));
                                     None
                                 }
                             }
@@ -278,9 +278,9 @@ impl LoadedVm {
                         .instrument(tracing::info_span!("restart"))
                         .await;
 
-                        if let Some((response, servicing_state)) = state {
+                        if let Some((rpc, servicing_state)) = state {
                             break Some(LoadedVmState {
-                                restart_response: response,
+                                restart_rpc: rpc,
                                 servicing_state,
                                 vm_rpc,
                                 control_send: self.control_send.lock().take().unwrap(),
@@ -304,6 +304,7 @@ impl LoadedVm {
                             inspect_helpers::vtl0_memory_map(&self.vtl0_memory_map),
                         );
                         resp.field("shared_vis_pool", &self.shared_vis_pool);
+                        resp.field("private_pool", &self.private_pool);
                         resp.field("memory", &self.memory);
                     }),
                 },
@@ -474,9 +475,9 @@ impl LoadedVm {
             anyhow::bail!("Servicing is not yet supported for isolated VMs");
         }
 
-        // capabilities_flags used to explicitly disable the feature
-        // which is enabled by default.
-        let nvme_keepalive = !capabilities_flags.disable_nvme_keepalive();
+        // NOTE: This is set via the corresponding env arg, as this feature is
+        // experimental.
+        let nvme_keepalive = self.nvme_keep_alive && capabilities_flags.enable_nvme_keepalive();
 
         // Do everything before the log flush under a span.
         let mut state = async {
@@ -626,8 +627,8 @@ impl LoadedVm {
 
         let emuplat = (self.emuplat_servicing.save()).context("emuplat save failed")?;
 
-        // Only save NVMe state when there are NVMe controllers and nvme_keepalive
-        // wasn't explicitly disabled through capabilities_flags, otherwise save None.
+        // Only save NVMe state when there are NVMe controllers and keep alive
+        // was enabled.
         let nvme_state = if let Some(n) = &self.nvme_manager {
             n.save(vf_keepalive_flag)
                 .instrument(tracing::info_span!("nvme_manager_save"))
@@ -649,12 +650,19 @@ impl LoadedVm {
             .map(vmcore::save_restore::SaveRestore::save)
             .transpose()
             .context("shared_vis_pool save failed")?;
-        let private_pool = self
-            .private_pool
-            .as_mut()
-            .map(vmcore::save_restore::SaveRestore::save)
-            .transpose()
-            .context("private_pool save failed")?;
+
+        // Only save private pool state if we are expected to keep VF devices
+        // alive across save. Otherwise, don't persist the state at all, as
+        // there should be no live DMA across save.
+        let private_pool = if vf_keepalive_flag {
+            self.private_pool
+                .as_mut()
+                .map(vmcore::save_restore::SaveRestore::save)
+                .transpose()
+                .context("private_pool save failed")?
+        } else {
+            None
+        };
 
         Ok(ServicingState {
             init_state: servicing::ServicingInitState {
