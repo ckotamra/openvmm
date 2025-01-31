@@ -105,6 +105,39 @@ fn read_msr_tdcall(msr_index: u32) -> u64 {
     msr_value
 }
 
+/// Gets tsc frequency from CPUID
+fn get_frequency_from_cpuid() -> u64 {
+    let mut eax: u32 = 0x15;
+    let mut ebx: u32 = 0;
+    let mut ecx: u32 = 0;
+    let mut edx: u32 = 0;
+
+    unsafe {
+        core::arch::asm! {
+            "cpuid",
+            inout("eax") eax => eax,
+            lateout("ecx") ecx,
+            lateout("edx") edx,
+            options(nostack)
+        }
+
+        core::arch::asm! {
+            "mov {:e}, ebx", out(reg) ebx
+        }
+    }
+
+    let _ = eax;
+    let _ = ebx;
+    let _ = ecx;
+    let _ = edx;
+
+    if eax != 0 {
+        (ebx as u64* ecx as u64) / eax as u64
+    } else {
+        0
+    }
+}
+
 /// Global variable to store tsc frequency.
 static TSC_FREQUENCY: SingleThreaded<Cell<u64>> = SingleThreaded(Cell::new(0));
 
@@ -113,9 +146,16 @@ pub fn get_tdx_tsc_reftime() -> Option<u64> {
     // This is first called by the BSP from openhcl_boot and the frequency
     // is saved in this gloabal variable. Subsequent calls use the global variable.
     if TSC_FREQUENCY.get() == 0 {
-        // TODO TDX: Getting tsc frequency from HV currently. Explore the option
-        // of getting it from more reliable source such as CPUID.
-        TSC_FREQUENCY.set(read_msr_tdcall(hvdef::HV_X64_MSR_TSC_FREQUENCY));
+
+        // Attempt to get the tsc frequency from CPUID. When it fails get it from HV MSR
+        let hw_frequency = get_frequency_from_cpuid();
+
+        if hw_frequency != 0 {
+            TSC_FREQUENCY.set(hw_frequency);    
+            crate::boot_logger::log!("HW Frequency from CPUID  {}", hw_frequency);
+        } else {
+            TSC_FREQUENCY.set(read_msr_tdcall(hvdef::HV_X64_MSR_TSC_FREQUENCY));
+        }
     }
 
     if TSC_FREQUENCY.get() != 0 {
